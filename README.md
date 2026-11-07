@@ -170,6 +170,8 @@ $env:TONGJI_API_KEY = 'sk-...'
 
 `range` 依次尝试 `1d` / `7d` / `30d`，后续沿用第一个成功的区间。余额先显示，用量在后台刷新。用量统计请求失败时保留上次结果。设置页的「刷新统计」使用当前令牌，首次还没有令牌时会先刷新余额。
 
+用量概览显示平台统计区间、调用次数、Token 和消耗点数。每日趋势支持查看近 7、14、30 个北京时间自然日，可点选柱子查看当天明细，也可展开日期表。模型表按 Token 总量降序列出每个模型的输入、缓存、输出、总量和占比。侧边栏的「今日 Token」只显示平台当天的记录。
+
 ---
 
 ## 登录（SSO + 短信二次认证）
@@ -259,7 +261,7 @@ SSO 仅访问 `iam.tongji.edu.cn` 和 `agi.tongji.edu.cn` 的 HTTPS 地址，密
 两套独立的文案体系，别混：
 
 - **`locale/{zh,en}.json`** —— 只有 `meta.title` 和 `meta.description`，给插件管理器 / 市场列表展示用。
-- **`lib/client.js` 里的 `DICTIONARIES`** —— 69 个运行时 UI key（状态、按钮、用量、短信验证等），随 client bundle 一起加载；`ctx.locale.register('dsh-tongji-agi.balance', DICTIONARIES)` 注册后，`t(key)` 优先走宿主 locale 服务，取不到再回落内联表。
+- **`lib/client.js` 里的 `DICTIONARIES`** —— 运行时 UI 文案（状态、按钮、用量、短信验证等），随 client bundle 一起加载。`ctx.locale.register('dsh-tongji-agi.balance', DICTIONARIES)` 注册后，`t(key)` 优先走宿主 locale 服务，取不到再回落内联表。
 
 加文案时两边都要动：给用户看的新按钮/新状态加到 `DICTIONARIES`（zh 与 en 各一份），只有插件描述变了才动 `locale/*.json`。
 

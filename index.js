@@ -149,7 +149,7 @@ function normalizeUsage({ range, stats, history }) {
     since: typeof stats?.since === 'string' ? stats.since : null,
     until: typeof stats?.until === 'string' ? stats.until : null,
     calls: numberOr(summary.calls),
-    textTokens: numberOr(summary.text_tokens),
+    textTokens: summary.text_tokens == null || summary.text_tokens === '' ? null : formatPoints(summary.text_tokens),
     pointsCost: numberOr(summary.points_cost),
     moneyCost: numberOr(summary.money_cost),
     totalTokens,
