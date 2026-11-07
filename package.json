@@ -1,6 +1,6 @@
 {
   "name": "dsh-tongji-agi",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Tongji University AI platform (AGI) provider route plus a balance and usage panel for the DeepSeek Harness web client.",
   "license": "MIT",
   "repository": {
