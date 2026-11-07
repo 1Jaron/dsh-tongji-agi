@@ -213,6 +213,8 @@ $env:TONGJI_API_KEY = 'sk-...'
 | `cordis.patch.yml` | bundle patch：provider 路由 + 注册 `tongji-balance` |
 | `locale/{zh,en}.json` | 插件管理器展示用的元数据 |
 | `icon.svg` | 插件图标 |
+| `LICENSE` | MIT |
+| `.gitattributes` | 强制 LF，避免 Windows 检出时 CRLF 污染 YAML / JS |
 
 7 个远程方法（`snapshot` / `watch` / `configure` / `forget` / `submitCode` / `resendCode` / `refreshUsage`）必须在三处保持一致：`index.js` 的 `REMOTE_METHODS` 方法表、`lib/typert.host.js` 的 `invocations`、`lib/client.js` 的 `CONTRIBUTION.descriptors`。任一处缺失，客户端就调不到该方法（`remote.tongji` 静默降级，只在日志里 warn）。
 
@@ -265,6 +267,6 @@ $env:TONGJI_API_KEY = 'sk-...'
 
 - **代理**：Harness 可能带 `NODE_USE_ENV_PROXY=1` 和一个不可用的 `ALL_PROXY`（例如 `http://127.0.0.1:51926`），导致所有请求卡死。所以每次请求都显式传 `agent: directAgent()`（`new Agent({ keepAlive: false, maxSockets: 8 })`），不走环境代理。
 - **样式**：宿主没有样式注入 API，`lib/client.js` 里全部用内联 `style` 对象。
-- **依赖**：不能 `import 'zod'`，也不能 `import '@deepseek-ai/dsh-typert-protocol'`——`link:` 挂载没有 `node_modules`，ESM 裸导入会 `ERR_MODULE_NOT_FOUND`，整条 entry 加载失败，client bundle 也不会进 `__DSH_BOOT__`。所以 `TongjiBalance` 是**普通 class**（不 `extends` 任何基类），协议字段自行实现，用 `ctx.provide('tongjiBalance', this)` 暴露。
+- **依赖**：不能 `import 'zod'`，也不能 `import '@deepseek-ai/dsh-typert-protocol'`——本包没有任何 `dependencies`，无论 `link:` 挂载还是从 git 安装，装完都没有 `node_modules` 里的这些包，ESM 裸导入会 `ERR_MODULE_NOT_FOUND`，整条 entry 加载失败，client bundle 也不会进 `__DSH_BOOT__`。所以 `TongjiBalance` 是**普通 class**（不 `extends` 任何基类），协议字段自行实现，用 `ctx.provide('tongjiBalance', this)` 暴露。真要加依赖，必须同时写进 `dependencies` 和 `files`。
 - **重启**：改 `index.js` 要重启 Harness；改 `lib/client.js` 有 client-hmr 自动热载。
 - **超时**：所有平台请求 `REQUEST_TIMEOUT = 15_000`；余额轮询 `POLL_INTERVAL = 30_000`，`snapshot()` 缓存 `CACHE_TTL = 8_000`，轮询 timer 已 `unref()` 并在 `ctx.effect` 里清理。
