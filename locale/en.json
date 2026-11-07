@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Tongji AI platform models",
+    "description": "Adds Tongji University's AI platform chat models (DeepSeek, GLM, Qwen, MiMo, MiniMax) to the model picker, with a key read from TONGJI_API_KEY."
+  }
+}

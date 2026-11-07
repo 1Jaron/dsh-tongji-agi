@@ -1,0 +1,91 @@
+# 同济大学人工智能服务平台（OpenAI 兼容）接入 @deepseek-ai/dsh-llm-pi-ai。
+#
+# 读取顺序：profile 的 package.json dsh.profile.bundles → 各 bundle 的 patch →
+# profile 自己的 cordis.patch.yml。本文件属于本包的 bundle 层。
+#
+# patch 是「整行替换 config」而非深合并：这里只写 providers，其余字段回落
+# schema 默认值。llm-pi-ai 在该 profile 里原本没有 provider 条目，所以替换
+# 不会丢掉已有路由（官方 DeepSeek 走 llm-deepseek 两行，与此无关）。
+#
+# 密钥不进配置文件：apiKeyEnv 只是引用名，每次请求经凭据 seam 解析
+# （托管凭据库优先，其次进程环境与 .env）。详见 README「密钥」。
+#
+# 模型 id 以该 key 实际可用的 `GET /v1/models` 为准（2026-11-06 实测 10 个，
+# 其中 Qwen3-Embedding / Qwen3-Reranker 不是对话模型，未列入）。平台文档里的
+# DeepSeek-R1 系列会返回 `400 {"error":{"message":"Invalid model: DeepSeek-R1"}}`。
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      tongji:
+        displayName: 同济 AGI
+        apiKeyEnv: TONGJI_API_KEY
+        api: openai-completions
+        baseURL: https://agi.tongji.edu.cn/v1
+        # provider 级默认值；每条 models 项仍显式重复，便于逐模型覆盖。
+        defaultContextWindow: 65536
+        defaultMaxTokens: 8192
+        models:
+          - id: DeepSeek-V4.1-Flash
+            name: 同济AGI
+            contextWindow: 65536
+            maxTokens: 8192
+            input: [text]
+          - id: GLM-5.3
+            name: GLM-5.3
+            contextWindow: 65536
+            maxTokens: 8192
+            input: [text]
+          - id: GLM-5.3-Flash
+            name: GLM-5.3 Flash
+            contextWindow: 65536
+            maxTokens: 8192
+            input: [text]
+          - id: Qwen3.8-Flash-Next
+            name: Qwen3.8 Flash Next
+            contextWindow: 65536
+            maxTokens: 8192
+            input: [text]
+          - id: Qwen3.8-27B
+            name: Qwen3.8 27B
+            contextWindow: 65536
+            maxTokens: 8192
+            input: [text]
+          - id: MiniMax-M3.1-Flash
+            name: MiniMax M3.1 Flash
+            contextWindow: 65536
+            maxTokens: 8192
+            input: [text]
+          - id: MiMo-V2.6-Pro
+            name: MiMo V2.6 Pro
+            contextWindow: 65536
+            maxTokens: 8192
+            input: [text]
+          - id: MiMo-V2.6-Flash
+            name: MiMo V2.6 Flash
+            contextWindow: 65536
+            maxTokens: 8192
+            input: [text]
+
+      # 同一平台另外两种协议端点，按需取消注释（同一把 key，字段同上）：
+      #
+      # tongji-anthropic:
+      #   displayName: 同济 AI 平台 (Anthropic Compatible)
+      #   apiKeyEnv: TONGJI_API_KEY
+      #   api: anthropic-messages
+      #   baseURL: https://agi.tongji.edu.cn/anthropic
+      #   models: [{ id: DeepSeek-V4.1-Flash, name: DeepSeek V4.1 Flash }]
+      #
+      # tongji-responses:
+      #   displayName: 同济 AI 平台 (Responses API)
+      #   apiKeyEnv: TONGJI_API_KEY
+      #   api: openai-responses
+      #   baseURL: https://agi.tongji.edu.cn/v1
+      #   models: [{ id: DeepSeek-V4.1-Flash, name: DeepSeek V4.1 Flash }]
+
+# 余额与用量服务：注册 tongjiBalance（命名空间 tongji），供 Web 客户端读取
+# 同济平台账户余额与用量统计。name 从 profile 的 node_modules 解析
+# （无论本包是 link: 挂载还是从 git / registry 安装，都按包名解析）。
+- insert:
+    - id: tongji-balance
+      name: 'dsh-tongji-agi'

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "同济 AI 平台模型",
+    "description": "将同济大学人工智能服务平台的对话模型（DeepSeek / GLM / Qwen / MiMo / MiniMax）接入模型选择器，密钥从 TONGJI_API_KEY 读取。"
+  }
+}
