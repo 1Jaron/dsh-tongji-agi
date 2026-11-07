@@ -3,7 +3,7 @@
 把同济大学人工智能服务平台（`agi.tongji.edu.cn`）接进 DeepSeek Harness，做两件事：
 
 1. **模型路由**：以 `llm-pi-ai` 的一个 provider（`tongji`）提供 8 个对话模型，走 OpenAI Chat Completions 协议。
-2. **余额与用量面板**：注册 `tongjiBalance` 服务，在 Web 客户端设置页显示账户余额、积分与用量统计，并在左侧栏底部显示一行积分余额。
+2. **余额与用量面板**：在设置的「同济AGI」分区查看余额、积分重置时间和用量统计，按需把这些信息显示在侧边栏底部。
 
 两半互相独立：只用模型不需要登录 SSO；只用面板也不需要 API key（面板走统一身份认证）。
 
@@ -11,7 +11,11 @@
 
 ## 安装与启用
 
-### 从 GitHub 安装（推荐）
+### 从 npm 安装（推荐）
+
+在 DSH 的 **设置 → 插件 → 添加插件** 中输入 `dsh-tongji-agi`，选择 npm 官方源。安装完成后点击「立即启用」，再到 **设置 → 模型 → 同济 AGI → 编辑** 填入 API Key。
+
+### 从 GitHub 安装
 
 在 Harness 的**设置 → 插件 → 安装**里填仓库地址：
 
@@ -64,9 +68,9 @@ https://github.com/1Jaron/dsh-tongji-agi
 
 启用后：
 
-- 模型选择器出现「同济 AI 平台」下的 8 个模型；
-- 设置页多出「同济余额」分区；
-- 左侧栏底部多出一行积分余额（可在设置页勾选显示项）。
+- 模型选择器出现「同济 AGI」下的 8 个模型。
+- 设置页新增「同济AGI」分区，内含 API Key 配置引导、余额、重置时间和用量。
+- 左侧栏底部显示积分摘要，可在「侧边栏显示」中点击图标卡片自定义。
 
 ---
 
@@ -84,9 +88,13 @@ https://github.com/1Jaron/dsh-tongji-agi
 
 ## 密钥
 
+1. 在[同济 AI 平台的 API Key 页面](https://agi.tongji.edu.cn/system/my-apikey?kind=plan)创建或复制 API Key。
+2. 打开 DSH 的 **设置 → 模型 → 同济 AGI → 编辑**，填入「API 密钥」并保存。
+3. 在会话的模型选择器里选择同济 AGI 的模型。要查看余额、重置时间和用量，请另外在 **设置 → 同济AGI → 账号设置** 登录统一身份认证。
+
 `cordis.patch.yml` 里的 `apiKeyEnv: TONGJI_API_KEY` 只是**引用名**，不是密钥本身。每次请求由凭据 seam 解析，优先级：托管凭据库（`$DSH_HOME/.credentials.yaml`）→ 进程环境变量 → `.env`。
 
-任选一种：
+也可通过宿主凭据库或环境变量配置。
 
 ```yaml
 # $DSH_HOME/.credentials.yaml
@@ -156,17 +164,21 @@ $env:TONGJI_API_KEY = 'sk-...'
 
 ---
 
-## 余额与用量
+## 余额、重置时间与用量
 
 面板通过 SSO 拿一个 JWT 当 Bearer，然后调：
 
 | 用途 | 请求 |
 | --- | --- |
 | 余额 | `GET /api/v1/billing/overview` |
+| 当前套餐 | `GET /api/v1/my-coding-plans?page=1&page_size=100` |
+| 套餐重置时间 | `GET /api/v1/my-coding-plans/{id}/usage` |
 | 用量统计 | `GET /api/v1/my-usage/stats?kind=plan&range=7d` |
 | 用量历史 | `GET /api/v1/my-usage/history?months=12` |
 
 余额读 `total_available`（点数模式）或 `wallet_balance`（订阅模式），面板按 `mode` 自动切换单位。401 时会清 token、重登一次再重试。
+
+点数模式下，插件和平台「我的套餐」一样选择最近生效且未过期的套餐，用 `next_reset_at` 显示下次重置时间（北京时间）。`points_reset_cycle` 为 `week` 时标注「每 7 天」，为 `month` 时标注「每月」。套餐查询在后台独立刷新，平台暂未返回有效时间时会显示提示。
 
 `range` 依次尝试 `1d` / `7d` / `30d`，后续沿用第一个成功的区间。余额先显示，用量在后台刷新。用量统计请求失败时保留上次结果。设置页的「刷新统计」使用当前令牌，首次还没有令牌时会先刷新余额。
 
@@ -201,7 +213,7 @@ SSO 仅访问 `iam.tongji.edu.cn` 和 `agi.tongji.edu.cn` 的 HTTPS 地址，密
 
 ## 侧边栏积分余额栏
 
-注册在 `sidebar.footer.action` 槽位（id `tongji-balance-rail`，`order: -10`），即左侧工作区列表下方那一行。显示项可勾选：积分、今日用量、主用模型、更新时间；四项全关时回落为只显示积分余额。
+注册在 `sidebar.footer.action` 槽位（id `tongji-balance-rail`，`order: -10`），位于左侧工作区列表下方。在 **设置 → 同济AGI → 侧边栏显示** 点击图标卡片，可切换积分余额、积分重置、今日 Token、今日调用、模型占比和刷新时间。下方预览与实际侧边栏同步，全部关闭时显示积分余额。
 
 选择存在 `localStorage` 的 `dsh-tongji-agi:rail-fields`（宿主没有 settings 服务，与 dsh-cost-meter 的做法一致），换浏览器或清缓存会回到默认值（只显示积分）。
 
@@ -211,7 +223,7 @@ SSO 仅访问 `iam.tongji.edu.cn` 和 `agi.tongji.edu.cn` 的 HTTPS 地址，密
 
 | 文件 | 作用 |
 | --- | --- |
-| `index.js` | host 半：`TongjiBalance` 服务、SSO、余额与用量拉取 |
+| `index.js` | 宿主侧 `TongjiBalance` 服务、SSO、余额、积分重置时间和用量拉取 |
 | `lib/typert.host.js` | host 侧远程方法声明（`TYPERT`） |
 | `lib/client.js` | 浏览器半：设置分区、侧边栏行、内联文案与样式 |
 | `cordis.patch.yml` | bundle patch：provider 路由 + 注册 `tongji-balance` |

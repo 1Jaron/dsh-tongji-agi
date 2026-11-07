@@ -7,6 +7,7 @@ const ACCOUNT_KEY = 'dsh-tongji-agi/account'
 const REMOTE_METHODS = '@deepseek-ai/dsh-typert-protocol/remote-methods'
 const POLL_INTERVAL = 30_000
 const CACHE_TTL = 8_000
+const POINTS_RESET_TTL = 5 * 60_000
 const REQUEST_TIMEOUT = 15_000
 
 /**
@@ -97,6 +98,17 @@ function pickBalance(overview) {
   const mode = typeof overview?.mode === 'string' ? overview.mode : 'subscription'
   const raw = mode === 'points' ? overview?.total_available : overview?.wallet_balance
   return { mode, points: formatPoints(raw) }
+}
+
+function platformTime(value) {
+  const millis = typeof value === 'number' ? value : typeof value === 'string' ? Date.parse(value) : NaN
+  return millis > 0 && millis <= 8.64e15 ? millis : NaN
+}
+
+function latestActivePlan(plans, now) {
+  return plans
+    .filter((plan) => plan?.status === 'active' && platformTime(plan.expires_at) > now && Number.isSafeInteger(Number(plan.id)) && Number(plan.id) > 0)
+    .sort((a, b) => (platformTime(b.started_at) || 0) - (platformTime(a.started_at) || 0) || b.id - a.id)[0]
 }
 
 function messageOf(response, fallback) {
@@ -504,6 +516,7 @@ const EMPTY_ACCOUNT_STATE = Object.freeze({
   mode: 'subscription',
   points: null,
   tokensPerPoint: null,
+  pointsReset: null,
   username: null,
   challenge: null,
   message: null,
@@ -534,6 +547,8 @@ export class TongjiBalance {
     this.credentialWrite = Promise.resolve()
     this.inflight = undefined
     this.usageInflight = undefined
+    this.pointsResetInflight = undefined
+    this.pointsResetCheckedAt = 0
     this.pendingChallenge = undefined
     this.usageRange = undefined
     this.listeners = new Set()
@@ -614,6 +629,8 @@ export class TongjiBalance {
       this.token = undefined
       this.inflight = undefined
       this.usageInflight = undefined
+      this.pointsResetInflight = undefined
+      this.pointsResetCheckedAt = 0
       this.usageRange = undefined
       this.fetchedAt = account ? 0 : Date.now()
       this.publish({
@@ -717,6 +734,46 @@ export class TongjiBalance {
     return apiRequest('GET', '/billing/overview', { token, signal })
   }
 
+  async fetchPointsReset(token, signal) {
+    // 同济平台「我的套餐」先选择最新的有效套餐，再读取其用量详情。
+    const plans = await apiRequest('GET', '/my-coding-plans', { token, signal, query: { page: 1, page_size: 100 } })
+    const list = plans.body?.data?.list
+    if (plans.status !== 200 || !Array.isArray(list)) return undefined
+    const plan = latestActivePlan(list, Date.now())
+    if (!plan) return null
+
+    const response = await apiRequest('GET', `/my-coding-plans/${Number(plan.id)}/usage`, { token, signal })
+    const details = response.body?.data
+    if (response.status !== 200 || !details) return undefined
+    if (details.billing_mode !== 'points') return null
+
+    const nextAt = platformTime(details.next_reset_at)
+    if (!Number.isFinite(nextAt)) return null
+    const cycle = details.points_reset_cycle
+    return Object.freeze({ nextAt, cycle: cycle === 'week' || cycle === 'month' ? cycle : null })
+  }
+
+  refreshPointsReset(token, signal) {
+    const now = Date.now()
+    const nextAt = this.state.pointsReset?.nextAt
+    const expired = nextAt !== undefined && nextAt <= now
+    const interval = expired ? POLL_INTERVAL : POINTS_RESET_TTL
+    if (this.pointsResetInflight || now - this.pointsResetCheckedAt < interval) return
+    this.pointsResetCheckedAt = now
+    const request = this.fetchPointsReset(token, signal)
+      .then((pointsReset) => {
+        if (pointsReset === undefined || signal.aborted || this.token !== token || this.state.mode !== 'points') return
+        if (nextAt === pointsReset?.nextAt && this.state.pointsReset?.cycle === pointsReset?.cycle) return
+        this.publish({ ...this.state, pointsReset })
+      }, () => {
+        // 套餐查询与余额独立，网络异常时继续显示上一次平台时间。
+      })
+      .finally(() => {
+        if (this.pointsResetInflight === request) this.pointsResetInflight = undefined
+      })
+    this.pointsResetInflight = request
+  }
+
   /**
    * 统计接口没有可用数据时保留上一次结果。
    */
@@ -813,6 +870,7 @@ export class TongjiBalance {
       if (response.status !== 200) throw new Error(messageOf(response, '同济平台余额查询失败'))
       const overview = response.body?.data ?? {}
       const { mode, points } = pickBalance(overview)
+      if (mode !== this.state.mode) this.pointsResetCheckedAt = 0
       this.fetchedAt = Date.now()
       this.publish({
         ...this.state,
@@ -821,11 +879,13 @@ export class TongjiBalance {
         mode,
         points,
         tokensPerPoint: typeof overview.tokens_per_point === 'number' ? overview.tokens_per_point : null,
+        pointsReset: mode === 'points' ? this.state.pointsReset : null,
         username: account.username,
         challenge: null,
         message: null,
         updatedAt: Date.now(),
       })
+      if (mode === 'points') this.refreshPointsReset(token, signal)
       // 余额先显示，用量失败或超时都保留上一次统计。
       void this.refreshUsage()
     } catch (error) {
