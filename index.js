@@ -1,6 +1,7 @@
 import { Agent, request } from 'node:https'
 
 const API_HOST = 'agi.tongji.edu.cn'
+const API_ORIGIN = `https://${API_HOST}`
 const API_BASE = '/api/v1'
 const ACCOUNT_KEY = 'dsh-tongji-agi/account'
 const REMOTE_METHODS = '@deepseek-ai/dsh-typert-protocol/remote-methods'
@@ -23,6 +24,7 @@ const MAX_SSO_HOPS = 10
 const SMS_CURRENT_AUTH = 'urn_oasis_names_tc_SAML_2.0_ac_classes_SMSUsernamePassword'
 /** IAM 页面在弹出短信框 180 秒后自动 reload，过期后必须重新走密码认证。 */
 const SMS_CHALLENGE_TTL = 170_000
+const SMS_EXPIRED = '验证码已过期，请重新登录'
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36'
 
@@ -41,8 +43,9 @@ function buildQuery(query) {
 }
 
 function apiRequest(method, path, options = {}) {
-  const { token, body, query } = options
+  const { token, body, query, signal } = options
   return new Promise((resolve, reject) => {
+    signal?.throwIfAborted()
     const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body), 'utf8')
     const headers = { accept: 'application/json' }
     if (payload) {
@@ -51,10 +54,11 @@ function apiRequest(method, path, options = {}) {
     }
     if (token) headers.authorization = `Bearer ${token}`
     const req = request(
-      { host: API_HOST, path: `${API_BASE}${path}${buildQuery(query)}`, method, headers, agent: directAgent(), timeout: REQUEST_TIMEOUT },
+      { host: API_HOST, path: `${API_BASE}${path}${buildQuery(query)}`, method, headers, agent: directAgent(), signal, timeout: REQUEST_TIMEOUT },
       (res) => {
         const chunks = []
         res.on('data', (chunk) => chunks.push(chunk))
+        res.on('error', reject)
         res.on('end', () => {
           const text = Buffer.concat(chunks).toString('utf8')
           let parsed
@@ -181,15 +185,19 @@ function readLoginForm(html) {
 function createCookieJar() {
   const store = new Map()
   return {
-    header() {
-      return [...store].map(([name, value]) => `${name}=${value}`).join('; ')
+    header(origin) {
+      const cookies = store.get(origin)
+      return cookies ? [...cookies].map(([name, value]) => `${name}=${value}`).join('; ') : ''
     },
-    absorb(setCookie) {
-      for (const cookie of setCookie ?? []) {
+    absorb(origin, setCookie) {
+      if (!setCookie?.length) return
+      const cookies = store.get(origin) ?? new Map()
+      for (const cookie of setCookie) {
         const [pair] = cookie.split(';')
         const index = pair.indexOf('=')
-        if (index > 0) store.set(pair.slice(0, index).trim(), pair.slice(index + 1).trim())
+        if (index > 0) cookies.set(pair.slice(0, index).trim(), pair.slice(index + 1).trim())
       }
+      store.set(origin, cookies)
     },
     clear() {
       store.clear()
@@ -210,13 +218,19 @@ function directAgent() {
  * 统一身份认证流程要靠手写 cookie jar 与 302 链，所以不能用 fetch 的自动跟随。
  */
 function ssoRequest(jar, url, init = {}) {
+  init.signal?.throwIfAborted()
   const target = new URL(url)
+  const { origin } = target
+  if ((origin !== IAM_ORIGIN && origin !== API_ORIGIN) || target.username || target.password) {
+    throw ssoError('请求', '发现不受信任的地址')
+  }
   const payload = init.body === undefined ? undefined : Buffer.from(init.body, 'utf8')
+  const cookie = jar.header(origin)
   const headers = {
     'user-agent': USER_AGENT,
     accept: 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
     'accept-language': 'zh-CN,zh;q=0.9',
-    ...(jar.header() ? { cookie: jar.header() } : {}),
+    ...(cookie ? { cookie } : {}),
     ...init.headers,
   }
   if (payload) headers['content-length'] = String(payload.length)
@@ -230,14 +244,17 @@ function ssoRequest(jar, url, init = {}) {
         method: init.method ?? 'GET',
         headers,
         agent: directAgent(),
+        signal: init.signal,
         timeout: REQUEST_TIMEOUT,
       },
       (res) => {
         const chunks = []
         res.on('data', (chunk) => chunks.push(chunk))
+        res.on('error', reject)
         res.on('end', () => {
-          jar.absorb(res.headers['set-cookie'])
+          jar.absorb(origin, res.headers['set-cookie'])
           resolve({
+            url: target.href,
             status: res.statusCode ?? 0,
             headers: res.headers,
             text: Buffer.concat(chunks).toString('utf8'),
@@ -272,23 +289,23 @@ function isSmsChallenge(body, text) {
 }
 
 /** 顺着 302 链找 /sso/callback?token=...，找到即返回令牌。 */
-async function followToToken(jar, first) {
+async function followToToken(jar, first, signal) {
   let current = first
-  let next = first.headers.location
-  for (let hop = 0; next && hop < MAX_SSO_HOPS; hop += 1) {
-    const url = new URL(next, IAM_ORIGIN).href
-    const matched = url.match(/\/sso\/callback\?token=([^&]+)/)
-    if (matched) return decodeURIComponent(matched[1])
-    current = await ssoRequest(jar, url)
-    next = current.headers.location
+  for (let hop = 0; current.headers.location && hop < MAX_SSO_HOPS; hop += 1) {
+    const target = new URL(current.headers.location, current.url)
+    if (target.origin === API_ORIGIN && target.pathname === SSO_CALLBACK && !target.username && !target.password) {
+      const token = target.searchParams.get('token')
+      if (token) return token
+    }
+    current = await ssoRequest(jar, target, { signal })
   }
   throw ssoError('回调', `未取得访问令牌（HTTP ${current.status}）`)
 }
 
 /** 请求 IAM 下发短信验证码；返回 undefined 表示成功，否则返回错误说明。 */
-async function sendSmsCode(challenge) {
+async function sendSmsCode(challenge, signal) {
   const body = new URLSearchParams({
-    j_username: challenge.account.username,
+    j_username: challenge.username,
     authenFlag: '',
     type: 'sms',
   }).toString()
@@ -296,6 +313,7 @@ async function sendSmsCode(challenge) {
   try {
     response = await ssoRequest(challenge.jar, `${IAM_ORIGIN}/idp/sendCheckCode.do`, {
       method: 'POST',
+      signal,
       headers: {
         'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
         'x-requested-with': 'XMLHttpRequest',
@@ -308,10 +326,10 @@ async function sendSmsCode(challenge) {
   } catch (error) {
     return error?.message ?? String(error)
   }
-  challenge.sentAt = Date.now()
   if (response.status !== 200) return `HTTP ${response.status}`
   if (/TooFast|过于频繁/i.test(response.text)) return '验证码发送过于频繁，请稍后再试'
   if (!/Successmsg|success/i.test(response.text)) return response.text.slice(0, 200) || '未知错误'
+  challenge.sentAt = Date.now()
   return undefined
 }
 
@@ -344,25 +362,29 @@ function describeChallenge(challenge) {
  *   3. j_checkcode 留空时必须原样回传提示文字「请输入验证码」；
  *   4. token 出现在 302 链的 /sso/callback?token=... 上，不需要再用 code 交换。
  */
-async function ssoStart(account) {
+async function ssoStart(account, signal) {
   const jar = createCookieJar()
   try {
-    const discover = await apiRequest('GET', `/auth/sso/discover?domain=${SSO_DOMAIN}`)
+    const discover = await apiRequest('GET', '/auth/sso/discover', { query: { domain: SSO_DOMAIN }, signal })
     const authorize = discover.body?.data?.redirect_url
     if (discover.status !== 200 || typeof authorize !== 'string' || !authorize) {
       throw ssoError('发现', messageOf(discover, '该学校暂未开通'))
     }
 
-    let page = await ssoRequest(jar, authorize)
+    let page = await ssoRequest(jar, authorize, { signal })
     for (let hop = 0; hop < 3 && page.status >= 300 && page.status < 400; hop += 1) {
       const location = page.headers.location
       if (!location) break
-      page = await ssoRequest(jar, new URL(location, authorize).href)
+      page = await ssoRequest(jar, new URL(location, page.url), { signal })
     }
     if (page.status !== 200) throw ssoError('打开登录页', `HTTP ${page.status}`)
 
     const form = readLoginForm(page.text)
     if (!form.action || !form.authnLcKey) throw ssoError('解析登录页', '未找到登录表单')
+    const action = new URL(form.action, page.url)
+    if (new URL(page.url).origin !== IAM_ORIGIN || action.origin !== IAM_ORIGIN || action.username || action.password) {
+      throw ssoError('解析登录页', '登录表单不属于同济统一身份认证')
+    }
 
     const payload = new URLSearchParams({
       j_username: account.username,
@@ -381,6 +403,7 @@ async function ssoStart(account) {
 
     const ajax = await ssoRequest(jar, `${IAM_ORIGIN}/idp/authcenter/ActionAuthChain?authnLcKey=${form.authnLcKey}`, {
       method: 'POST',
+      signal,
       headers: { ...commonHeaders, 'content-type': 'application/x-www-form-urlencoded; charset=UTF-8', 'x-requested-with': 'XMLHttpRequest', accept: '*/*' },
       body: payload,
     })
@@ -396,7 +419,7 @@ async function ssoStart(account) {
         // 密码是对的，只是被要求做增强认证。保留 jar/lcKey/chain，等用户回填验证码。
         const challenge = {
           jar,
-          account,
+          username: account.username,
           authnLcKey: form.authnLcKey,
           chainCode: ajaxBody?.spAuthChainCode ?? form.chainCode ?? '',
           mobile: typeof ajaxBody?.mobile === 'string' ? ajaxBody.mobile : '',
@@ -404,7 +427,7 @@ async function ssoStart(account) {
           sentAt: 0,
           createdAt: Date.now(),
         }
-        const failure = await sendSmsCode(challenge)
+        const failure = await sendSmsCode(challenge, signal)
         if (failure) throw ssoError('发送短信验证码', failure)
         jar.kept = true
         return { kind: 'challenge', challenge }
@@ -412,8 +435,8 @@ async function ssoStart(account) {
       throw ssoError('登录', ajaxBody?.loginFailed === 'true' ? '账号或密码不正确' : ajaxText.slice(0, 200) || `HTTP ${ajax.status}`)
     }
 
-    const submit = await ssoRequest(jar, new URL(form.action, IAM_ORIGIN).href, { method: 'POST', headers: commonHeaders, body: payload })
-    return { kind: 'token', token: await followToToken(jar, submit) }
+    const submit = await ssoRequest(jar, action, { method: 'POST', headers: commonHeaders, body: payload, signal })
+    return { kind: 'token', token: await followToToken(jar, submit, signal) }
   } finally {
     if (!jar.kept) jar.clear()
   }
@@ -423,74 +446,70 @@ async function ssoStart(account) {
  * 用用户填的短信验证码完成二级认证，返回 access_token。
  * 表单字段与 IAM 二级认证页 (#authen4Form) 完全一致。
  */
-async function ssoFinish(challenge, code) {
+async function ssoFinish(challenge, code, signal) {
   const { jar, authnLcKey } = challenge
-  try {
-    const fields = {
-      j_username: challenge.account.username,
-      type: 'sms',
-      sms_checkcode: code,
-      popViewException: 'Pop2',
-      op: 'login',
-      spAuthChainCode: challenge.chainCode ?? '',
-      j_checkcode: IAM_LOGIN_FIELD_CHECKCODE,
-    }
-    const payload = new URLSearchParams(fields).toString()
-    const chainUrl = `${IAM_ORIGIN}/idp/authcenter/ActionAuthChain?authnLcKey=${authnLcKey}&doBiomAuth=1`
-    const referer = `${IAM_ORIGIN}/idp/authcenter/ActionAuthChain?entityId=SYS20260057&authnLcKey=${authnLcKey}`
-
-    // 第一步：与浏览器 doSubmit() 一致，用 ajax 把 #authen4Form 提交回 ActionAuthChain，
-    // 由它校验短信验证码。校验通过时返回 {"loginFailed":"false"}，页面随后才真正
-    // 把表单 POST 到 AuthnEngine 以换取 302 -> /sso/callback?token=…。
-    const check = await ssoRequest(jar, chainUrl, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
-        'x-requested-with': 'XMLHttpRequest',
-        accept: '*/*',
-        origin: IAM_ORIGIN,
-        referer,
-      },
-      body: payload,
-    })
-    let answer = null
-    try {
-      answer = JSON.parse(check.text)
-    } catch {
-      answer = null
-    }
-    if (!answer) {
-      throw ssoError('验证码校验', `响应无法解析（HTTP ${check.status}）`)
-    }
-    const passed = answer.loginFailed === 'false' || answer.loginFailed === false || answer.loginFailed === undefined
-    if (!passed) {
-      // 验证码错误 / 过期 / 会话失效：IAM 会返回 view + 提示文案，此时不能继续提交。
-      const tip = answer.authnErrorTip || answer.loginFailed || ''
-      if (/验证码|错误|过期|不正确/.test(tip)) {
-        throw new Error(`短信验证码不正确或已过期：${tip}`)
-      }
-      throw ssoError('验证码校验', tip || `HTTP ${check.status}`)
-    }
-
-    // 第二步：验证码通过后，浏览器会真正提交表单并跟随 302 拿 token。
-    const submit = await ssoRequest(
-      jar,
-      `${IAM_ORIGIN}/idp/AuthnEngine?currentAuth=${encodeURIComponent(SMS_CURRENT_AUTH)}&authnLcKey=${authnLcKey}&entityId=SYS20260057`,
-      {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/x-www-form-urlencoded',
-          origin: IAM_ORIGIN,
-          referer,
-        },
-        body: payload,
-      },
-    )
-    return await followToToken(jar, submit)
-  } finally {
-    jar.clear()
+  const payload = new URLSearchParams({
+    j_username: challenge.username,
+    type: 'sms',
+    sms_checkcode: code,
+    popViewException: 'Pop2',
+    op: 'login',
+    spAuthChainCode: challenge.chainCode ?? '',
+    j_checkcode: IAM_LOGIN_FIELD_CHECKCODE,
+  }).toString()
+  const chainUrl = `${IAM_ORIGIN}/idp/authcenter/ActionAuthChain?authnLcKey=${authnLcKey}&doBiomAuth=1`
+  const headers = {
+    'content-type': 'application/x-www-form-urlencoded',
+    origin: IAM_ORIGIN,
+    referer: `${IAM_ORIGIN}/idp/authcenter/ActionAuthChain?entityId=SYS20260057&authnLcKey=${authnLcKey}`,
   }
+
+  // IAM 先校验验证码，只有通过后才提交表单来获取令牌。
+  const check = await ssoRequest(jar, chainUrl, {
+    method: 'POST',
+    signal,
+    headers: {
+      ...headers,
+      'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      'x-requested-with': 'XMLHttpRequest',
+      accept: '*/*',
+    },
+    body: payload,
+  })
+  let answer
+  try {
+    answer = JSON.parse(check.text)
+  } catch {
+    throw ssoError('验证码校验', `响应无法解析（HTTP ${check.status}）`)
+  }
+  const passed = answer && (answer.loginFailed === 'false' || answer.loginFailed === false || answer.loginFailed === undefined)
+  if (check.status !== 200 || !passed) {
+    const tip = answer?.authnErrorTip || answer?.loginFailed || ''
+    if (/验证码|错误|过期|不正确/.test(tip)) {
+      throw new Error(`短信验证码不正确或已过期：${tip}`)
+    }
+    throw ssoError('验证码校验', tip || `HTTP ${check.status}`)
+  }
+  const submit = await ssoRequest(
+    jar,
+    `${IAM_ORIGIN}/idp/AuthnEngine?currentAuth=${encodeURIComponent(SMS_CURRENT_AUTH)}&authnLcKey=${authnLcKey}&entityId=SYS20260057`,
+    { method: 'POST', headers, body: payload, signal },
+  )
+  return followToToken(jar, submit, signal)
 }
+
+const EMPTY_ACCOUNT_STATE = Object.freeze({
+  status: 'unconfigured',
+  configured: false,
+  mode: 'subscription',
+  points: null,
+  tokensPerPoint: null,
+  username: null,
+  challenge: null,
+  message: null,
+  usage: null,
+  updatedAt: null,
+})
 
 export class TongjiBalance {
   static inject = ['credentials']
@@ -511,28 +530,23 @@ export class TongjiBalance {
     this.token = undefined
     this.serial = 0
     this.fetchedAt = 0
+    this.accountSession = new AbortController()
+    this.credentialWrite = Promise.resolve()
     this.inflight = undefined
+    this.usageInflight = undefined
     this.pendingChallenge = undefined
     this.usageRange = undefined
     this.listeners = new Set()
-    this.state = Object.freeze({
-      status: 'idle',
-      configured: false,
-      mode: 'subscription',
-      points: null,
-      tokensPerPoint: null,
-      username: null,
-      challenge: null,
-      message: null,
-      usage: null,
-      updatedAt: null,
-      serial: 0,
-    })
+    this.state = Object.freeze({ ...EMPTY_ACCOUNT_STATE, status: 'idle', serial: 0 })
     const timer = setInterval(() => {
       void this.refresh().catch(() => {})
     }, POLL_INTERVAL)
     timer.unref?.()
-    this.ctx.effect(() => () => clearInterval(timer), 'dsh-tongji-agi: balance polling')
+    this.ctx.effect(() => () => {
+      clearInterval(timer)
+      this.accountSession.abort()
+      this.pendingChallenge?.jar.clear()
+    }, 'dsh-tongji-agi: balance polling')
   }
 
   snapshot() {
@@ -541,51 +555,77 @@ export class TongjiBalance {
   }
 
   async *watch(signal) {
+    if (signal.aborted) return
     let pending = this.state
-    let wake = () => {}
+    let delivered
+    let wake
     const listener = (next) => {
       pending = next
-      wake()
+      wake?.()
+    }
+    const stop = () => {
+      this.listeners.delete(listener)
+      wake?.()
     }
     this.listeners.add(listener)
+    signal.addEventListener('abort', stop, { once: true })
     try {
-      yield pending
       while (!signal.aborted) {
-        await new Promise((resolve) => {
-          wake = resolve
-        })
-        if (signal.aborted) return
-        yield pending
+        if (pending !== delivered) {
+          delivered = pending
+          yield delivered
+        } else {
+          await new Promise((resolve) => { wake = resolve })
+          wake = undefined
+        }
       }
     } finally {
-      this.listeners.delete(listener)
+      stop()
+      signal.removeEventListener('abort', stop)
     }
   }
 
   async configure(username, password) {
-    const account = typeof username === 'string' ? username.trim() : ''
+    const name = typeof username === 'string' ? username.trim() : ''
     const secret = typeof password === 'string' ? password : ''
-    if (!account) throw new Error('请输入同济统一身份认证账号')
+    if (!name) throw new Error('请输入同济统一身份认证账号')
     if (!secret) throw new Error('请输入密码')
-    await this.ctx.credentials.modifyRecord(ACCOUNT_KEY, async () => ({
-      kind: 'grant',
-      payload: { username: account, password: secret },
-    }))
-    this.token = undefined
-    this.pendingChallenge = undefined
-    this.fetchedAt = 0
-    await this.settleInflight()
-    await this.refresh()
-    return this.state
+    const signal = await this.setAccount({ username: name, password: secret })
+    return signal.aborted ? this.state : this.refresh()
   }
 
   async forget() {
-    await this.ctx.credentials.deleteRecord(ACCOUNT_KEY)
-    this.token = undefined
-    this.pendingChallenge = undefined
-    this.fetchedAt = 0
-    this.publish({ ...this.state, status: 'unconfigured', configured: false, points: null, username: null, challenge: null, message: null, usage: null })
+    await this.setAccount()
     return this.state
+  }
+
+  setAccount(account) {
+    // 凭据写入按调用顺序完成。提交新凭据后，立即取消旧账号的网络请求。
+    const write = this.credentialWrite.then(async () => {
+      if (account) {
+        await this.ctx.credentials.modifyRecord(ACCOUNT_KEY, async () => ({ kind: 'grant', payload: account }))
+      } else {
+        await this.ctx.credentials.deleteRecord(ACCOUNT_KEY)
+      }
+      this.accountSession.abort()
+      this.accountSession = new AbortController()
+      this.pendingChallenge?.jar.clear()
+      this.pendingChallenge = undefined
+      this.token = undefined
+      this.inflight = undefined
+      this.usageInflight = undefined
+      this.usageRange = undefined
+      this.fetchedAt = account ? 0 : Date.now()
+      this.publish({
+        ...EMPTY_ACCOUNT_STATE,
+        status: account ? 'loading' : 'unconfigured',
+        configured: Boolean(account),
+        username: account?.username ?? null,
+      })
+      return this.accountSession.signal
+    })
+    this.credentialWrite = write.catch(() => {})
+    return write
   }
 
   publish(next) {
@@ -610,8 +650,10 @@ export class TongjiBalance {
     return { username, password }
   }
 
-  async login(account) {
-    const outcome = await ssoStart(account)
+  async login(account, signal) {
+    const outcome = await ssoStart(account, signal)
+    if (signal.aborted && outcome.kind === 'challenge') outcome.challenge.jar.clear()
+    signal.throwIfAborted()
     if (outcome.kind === 'challenge') {
       // 短信二级认证：把 challenge 留在内存里，等用户回填验证码。
       this.pendingChallenge = outcome.challenge
@@ -626,47 +668,65 @@ export class TongjiBalance {
    * 用户填完短信验证码后调用。成功即拿到令牌并把面板切回余额。
    */
   async submitCode(code) {
-    const challenge = this.pendingChallenge
-    if (!challenge) throw new Error('没有待验证的登录请求，请重新登录')
     const text = typeof code === 'string' ? code.trim() : ''
     if (!/^[0-9]{1,6}$/.test(text)) throw new Error('请输入短信中的数字验证码')
-    if (Date.now() - (challenge.createdAt ?? 0) > SMS_CHALLENGE_TTL) {
+    return this.withSmsChallenge(async (challenge, signal) => {
+      const token = await ssoFinish(challenge, text, signal)
+      signal.throwIfAborted()
+      challenge.jar.clear()
       this.pendingChallenge = undefined
-      this.token = undefined
-      throw new Error('验证码已过期，请重新登录')
-    }
-    this.pendingChallenge = undefined
-    const token = await ssoFinish(challenge, text)
-    this.token = token
-    this.fetchedAt = 0
-    return this.refresh()
+      this.token = token
+      this.fetchedAt = 0
+      return this.refresh()
+    })
   }
 
   /** 重新发一条短信（IAM 有 180 秒冷却，太快会返回提示）。 */
   async resendCode() {
-    const challenge = this.pendingChallenge
-    if (!challenge) throw new Error('没有待验证的登录请求，请重新登录')
-    const failure = await sendSmsCode(challenge)
-    if (failure) throw new Error(failure)
-    this.publish({ ...this.state, status: 'challenge', challenge: describeChallenge(challenge), message: null })
-    return this.state
+    return this.withSmsChallenge(async (challenge, signal) => {
+      const failure = await sendSmsCode(challenge, signal)
+      signal.throwIfAborted()
+      if (failure) throw new Error(failure)
+      return this.publish({ ...this.state, status: 'challenge', challenge: describeChallenge(challenge), message: null })
+    })
   }
 
-  async fetchOverview(token) {
-    return apiRequest('GET', '/billing/overview', { token })
+  async withSmsChallenge(action) {
+    const challenge = this.pendingChallenge
+    if (!challenge) throw new Error('没有待验证的登录请求，请重新登录')
+    if (challenge.busy) throw new Error('正在处理短信验证码，请稍候')
+    if (this.expireChallenge(challenge)) throw new Error(SMS_EXPIRED)
+    challenge.busy = true
+    try {
+      return await action(challenge, this.accountSession.signal)
+    } finally {
+      challenge.busy = false
+    }
+  }
+
+  expireChallenge(challenge) {
+    if (Date.now() < challenge.createdAt + SMS_CHALLENGE_TTL) return false
+    challenge.jar.clear()
+    if (this.state.challenge) {
+      this.publish({ ...this.state, status: 'error', challenge: null, message: SMS_EXPIRED })
+    }
+    return true
+  }
+
+  async fetchOverview(token, signal) {
+    return apiRequest('GET', '/billing/overview', { token, signal })
   }
 
   /**
-   * 用量统计是「锦上添花」：任何一步失败都不能影响余额显示，
-   * 所以这里只返回 null 而不抛错，由 runRefresh 决定是否保留旧值。
+   * 统计接口没有可用数据时保留上一次结果。
    */
-  async fetchUsage(token) {
+  async fetchUsage(token, signal) {
     const ranges = this.usageRange ? [this.usageRange] : USAGE_RANGES
     let stats = undefined
     let usedRange = null
     for (const range of ranges) {
-      const response = await apiRequest('GET', '/my-usage/stats', { token, query: { kind: 'plan', range } })
-      if (response.status === 401) return { unauthorized: true }
+      const response = await apiRequest('GET', '/my-usage/stats', { token, signal, query: { kind: 'plan', range } })
+      if (response.status === 401) return null
       if (response.status === 200 && response.body?.data) {
         stats = response.body.data
         usedRange = range
@@ -674,8 +734,7 @@ export class TongjiBalance {
       }
     }
     if (!stats) return null
-    this.usageRange = usedRange
-    const history = await apiRequest('GET', '/my-usage/history', { token, query: { months: 12 } })
+    const history = await apiRequest('GET', '/my-usage/history', { token, signal, query: { months: 12 } })
     return normalizeUsage({
       range: usedRange,
       stats,
@@ -685,103 +744,75 @@ export class TongjiBalance {
 
   refresh() {
     if (this.inflight) return this.inflight
-    this.inflight = this.runRefresh().finally(() => {
-      this.inflight = undefined
+    if (this.pendingChallenge) {
+      // 等待验证码期间只检查有效期。会话过期后由用户重新登录。
+      if (!this.pendingChallenge.busy) this.expireChallenge(this.pendingChallenge)
+      return Promise.resolve(this.state)
+    }
+    const inflight = this.runRefresh(this.accountSession.signal).finally(() => {
+      if (this.inflight === inflight) this.inflight = undefined
     })
-    return this.inflight
+    this.inflight = inflight
+    return inflight
   }
 
   /**
    * 只刷统计、不重登也不动余额：设置页的「刷新统计」按钮走这里。
    * 拿不到 token 时退化成整轮刷新，保证首次点也能出数。
    */
-  async refreshUsage() {
-    await this.settleInflight()
-    let token = this.token
+  refreshUsage() {
+    const token = this.token
     if (!token) return this.refresh()
-    let outcome = await this.fetchUsage(token)
-    if (outcome?.unauthorized) {
-      this.token = undefined
-      return this.refresh()
-    }
-    if (outcome) this.publish({ ...this.state, usage: outcome })
-    return this.state
+    if (this.usageInflight?.token === token) return this.usageInflight.promise
+    const signal = this.accountSession.signal
+    const promise = this.fetchUsage(token, signal)
+      .then((usage) => {
+        if (usage && !signal.aborted && this.token === token) {
+          this.usageRange = usage.range
+          this.publish({ ...this.state, usage })
+        }
+        return this.state
+      }, () => this.state)
+      .finally(() => {
+        if (this.usageInflight?.promise === promise) this.usageInflight = undefined
+      })
+    this.usageInflight = { token, promise }
+    return promise
   }
 
-  /**
-   * configure()/forget() 改的是凭据，不能搭在一轮「旧凭据」的刷新上：
-   * 否则那一轮会把状态覆盖成 unconfigured，用户看到保存失败。
-   */
-  async settleInflight() {
-    if (!this.inflight) return
-    try {
-      await this.inflight
-    } catch {
-      // 旧一轮的失败与本次操作无关。
-    }
-  }
-
-  async runRefresh() {
+  async runRefresh(signal) {
+    if (signal.aborted) return this.state
     this.publish({ ...this.state, status: 'loading' })
     let account
     try {
       account = await this.readAccount()
     } catch (error) {
-      this.publish({ ...this.state, status: 'error', message: `读取凭据失败：${error?.message ?? error}` })
+      if (!signal.aborted) {
+        this.fetchedAt = Date.now()
+        this.publish({ ...this.state, status: 'error', message: `读取凭据失败：${error?.message ?? error}` })
+      }
       return this.state
     }
+    if (signal.aborted) return this.state
     if (!account) {
-      this.pendingChallenge = undefined
-      this.publish({
-        ...this.state,
-        status: 'unconfigured',
-        configured: false,
-        points: null,
-        username: null,
-        challenge: null,
-        message: null,
-        usage: null,
-      })
+      this.token = undefined
       this.fetchedAt = Date.now()
-      return this.state
-    }
-
-    // 已经停在「等短信验证码」这一步：30 秒轮询不能再去登录，
-    // 否则每次轮询都会重新发一条短信、把用户正在填的那个 challenge 顶掉。
-    if (this.pendingChallenge) {
-      this.publish({
-        ...this.state,
-        status: 'challenge',
-        configured: true,
-        username: account.username,
-        challenge: describeChallenge(this.pendingChallenge),
-        message: null,
-      })
-      return this.state
+      return this.publish(EMPTY_ACCOUNT_STATE)
     }
 
     try {
-      let token = this.token
-      if (!token) token = await this.login(account)
-      let response = await this.fetchOverview(token)
+      let token = this.token ?? await this.login(account, signal)
+      let response = await this.fetchOverview(token, signal)
+      signal.throwIfAborted()
       if (response.status === 401) {
         this.token = undefined
-        token = await this.login(account)
-        response = await this.fetchOverview(token)
+        token = await this.login(account, signal)
+        response = await this.fetchOverview(token, signal)
+        signal.throwIfAborted()
       }
       if (response.status !== 200) throw new Error(messageOf(response, '同济平台余额查询失败'))
       const overview = response.body?.data ?? {}
       const { mode, points } = pickBalance(overview)
-      // 统计接口与余额共用 token；若它先过期，重登一次再取，失败则沿用上一轮数据。
-      let usage = this.state.usage
-      const usageOutcome = await this.fetchUsage(token)
-      if (usageOutcome?.unauthorized) {
-        this.token = undefined
-        token = await this.login(account)
-        usage = (await this.fetchUsage(token)) ?? this.state.usage
-      } else if (usageOutcome) {
-        usage = usageOutcome
-      }
       this.fetchedAt = Date.now()
       this.publish({
         ...this.state,
@@ -790,13 +821,15 @@ export class TongjiBalance {
         mode,
         points,
         tokensPerPoint: typeof overview.tokens_per_point === 'number' ? overview.tokens_per_point : null,
-        usage,
         username: account.username,
         challenge: null,
         message: null,
         updatedAt: Date.now(),
       })
+      // 余额先显示，用量失败或超时都保留上一次统计。
+      void this.refreshUsage()
     } catch (error) {
+      if (signal.aborted) return this.state
       this.fetchedAt = Date.now()
       if (error instanceof SmsChallengePending) {
         this.publish({

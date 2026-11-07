@@ -168,7 +168,7 @@ $env:TONGJI_API_KEY = 'sk-...'
 
 余额读 `total_available`（点数模式）或 `wallet_balance`（订阅模式），面板按 `mode` 自动切换单位。401 时会清 token、重登一次再重试。
 
-`range` 依次尝试 `1d` / `7d` / `30d`，第一个成功的会被记住（`this.usageRange`），后续沿用。用量统计是「锦上添花」：拿不到就返回 `null` 并保留上一轮数据，不会把整个面板打成错误态。设置页的「刷新统计」只调 `refreshUsage()`，不碰余额、不触发重登。
+`range` 依次尝试 `1d` / `7d` / `30d`，后续沿用第一个成功的区间。余额先显示，用量在后台刷新。用量统计请求失败时保留上次结果。设置页的「刷新统计」使用当前令牌，首次还没有令牌时会先刷新余额。
 
 ---
 
@@ -176,10 +176,12 @@ $env:TONGJI_API_KEY = 'sk-...'
 
 账号密码不落盘到明文配置，而是写进宿主凭据库的 `dsh-tongji-agi/account` 记录（`kind: 'grant'`），登录流程：
 
-1. `GET https://iam.tongji.edu.cn/idp/sso/discover?domain=tongji` —— `domain` 必须是字面量 `tongji`，不是邮箱域名。
+1. 向 `https://agi.tongji.edu.cn/api/v1/auth/sso/discover?domain=tongji` 获取统一身份认证的登录地址。
 2. 跟随 3 次 302 到登录页，从 HTML 里取三样东西：`authen1Form` 的 `action`、`authnLcKey`，以及内联脚本 `$("#spAuthChainCode1").val('...')` 里的 `spAuthChainCode`（**不是**那个隐藏域的 `value`，它是空串）。
 3. 两次 POST：先 `ActionAuthChain`（带 `X-Requested-With`，返回 `{"loginFailed":"false"}`），再 `AuthnEngine`。`j_checkcode` 留空时必须原样回传 `请输入验证码`，否则被当成校验失败。
 4. 成功后 302 到 `https://agi.tongji.edu.cn/sso/callback?token=<JWT>`，把这个 JWT 直接当 `Authorization: Bearer` 用。
+
+SSO 仅访问 `iam.tongji.edu.cn` 和 `agi.tongji.edu.cn` 的 HTTPS 地址，密码只提交给 IAM，两站的会话 Cookie 分开保存。清除或更换账号会取消旧账号的查询，并清空面板里的旧账号数据。
 
 ### 短信二次认证
 
@@ -187,7 +189,7 @@ $env:TONGJI_API_KEY = 'sk-...'
 
 触发后服务进入 `challenge` 状态并**暂停自动刷新**（否则 30 秒轮询会重发短信、顶掉用户正在填的那次），面板显示验证码输入框：
 
-- **提交**：`submitCode(code)`，只接受 1–6 位数字；超过 `SMS_CHALLENGE_TTL`（170 秒）报「验证码已过期，请重新登录」。
+- **提交**：`submitCode(code)` 接受 1–6 位数字。输错后可在当前会话继续尝试。会话有效期为 170 秒，过期后需重新登录。
 - **重发**：`resendCode()`，IAM 侧有 180 秒冷却，太频繁会报「验证码发送过于频繁，请稍后再试」。
 - 没有待验证请求时提交会报「没有待验证的登录请求，请重新登录」。
 
