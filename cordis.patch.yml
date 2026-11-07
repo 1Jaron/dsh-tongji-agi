@@ -27,7 +27,7 @@
         defaultMaxTokens: 8192
         models:
           - id: DeepSeek-V4.1-Flash
-            name: 同济AGI
+            name: DeepSeek-V4.1-Flash
             contextWindow: 65536
             maxTokens: 8192
             input: [text]
@@ -74,14 +74,14 @@
       #   apiKeyEnv: TONGJI_API_KEY
       #   api: anthropic-messages
       #   baseURL: https://agi.tongji.edu.cn/anthropic
-      #   models: [{ id: DeepSeek-V4.1-Flash, name: DeepSeek V4.1 Flash }]
+      #   models: [{ id: DeepSeek-V4.1-Flash, name: DeepSeek-V4.1-Flash }]
       #
       # tongji-responses:
       #   displayName: 同济 AI 平台 (Responses API)
       #   apiKeyEnv: TONGJI_API_KEY
       #   api: openai-responses
       #   baseURL: https://agi.tongji.edu.cn/v1
-      #   models: [{ id: DeepSeek-V4.1-Flash, name: DeepSeek V4.1 Flash }]
+      #   models: [{ id: DeepSeek-V4.1-Flash, name: DeepSeek-V4.1-Flash }]
 
 # 余额与用量服务：注册 tongjiBalance（命名空间 tongji），供 Web 客户端读取
 # 同济平台账户余额与用量统计。name 从 profile 的 node_modules 解析
