@@ -3,6 +3,8 @@ import { Agent, request } from 'node:https'
 const API_HOST = 'agi.tongji.edu.cn'
 const API_ORIGIN = `https://${API_HOST}`
 const API_BASE = '/api/v1'
+const MODEL_KEY = 'TONGJI_API_KEY'
+const KIMI_MODEL_ID = 'Kimi-K3.1-Pro'
 const ACCOUNT_KEY = 'dsh-tongji-agi/account'
 const REMOTE_METHODS = '@deepseek-ai/dsh-typert-protocol/remote-methods'
 const POLL_INTERVAL = 30_000
@@ -44,7 +46,7 @@ function buildQuery(query) {
 }
 
 function apiRequest(method, path, options = {}) {
-  const { token, body, query, signal } = options
+  const { token, body, query, signal, base = API_BASE } = options
   return new Promise((resolve, reject) => {
     signal?.throwIfAborted()
     const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body), 'utf8')
@@ -55,7 +57,7 @@ function apiRequest(method, path, options = {}) {
     }
     if (token) headers.authorization = `Bearer ${token}`
     const req = request(
-      { host: API_HOST, path: `${API_BASE}${path}${buildQuery(query)}`, method, headers, agent: directAgent(), signal, timeout: REQUEST_TIMEOUT },
+      { host: API_HOST, path: `${base}${path}${buildQuery(query)}`, method, headers, agent: directAgent(), signal, timeout: REQUEST_TIMEOUT },
       (res) => {
         const chunks = []
         res.on('data', (chunk) => chunks.push(chunk))
@@ -116,6 +118,22 @@ function messageOf(response, fallback) {
   if (text) return text
   if (typeof response?.status === 'number' && response.status > 0) return `${fallback} (HTTP ${response.status})`
   return fallback
+}
+
+function modelConnectionResult(response) {
+  const { status, body } = response
+  if (status === 200 && Array.isArray(body?.data)) {
+    const ids = body.data.map((model) => model?.id).filter((id) => typeof id === 'string' && id.length > 0)
+    return { status: ids.includes(KIMI_MODEL_ID) ? 'ready' : 'model_unavailable' }
+  }
+  const message = [body?.error?.message, body?.message].filter((value) => typeof value === 'string').join(' ')
+  if (status === 403 && /网络环境|网段|ip (?:address |range )?(?:not allowed|restricted)/i.test(message)) {
+    return { status: 'network_restricted' }
+  }
+  if (status === 401 || (status === 403 && /密钥|api[ _-]?key/i.test(message))) {
+    return { status: 'invalid_key' }
+  }
+  return { status: 'request_failed', httpStatus: status || null }
 }
 
 /**
@@ -521,6 +539,7 @@ const EMPTY_ACCOUNT_STATE = Object.freeze({
   challenge: null,
   message: null,
   usage: null,
+  usageError: null,
   updatedAt: null,
 })
 
@@ -567,6 +586,30 @@ export class TongjiBalance {
   snapshot() {
     if (Date.now() - this.fetchedAt > CACHE_TTL) void this.refresh().catch(() => {})
     return this.state
+  }
+
+  refreshBalance() {
+    if (!this.inflight && this.state.usageError === 'session') this.token = undefined
+    return this.refresh()
+  }
+
+  async checkModelConnection(probe) {
+    try {
+      if (probe !== true) {
+        const info = await this.ctx.credentials.describe(MODEL_KEY)
+        return { status: info.configured ? 'configured' : 'missing_key' }
+      }
+      const key = (await this.ctx.credentials.resolve(MODEL_KEY))?.value
+      if (!key) return { status: 'missing_key' }
+      const response = await apiRequest('GET', '/models', {
+        base: '/v1',
+        token: key,
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT),
+      })
+      return modelConnectionResult(response)
+    } catch {
+      return { status: 'request_failed', httpStatus: null }
+    }
   }
 
   async *watch(signal) {
@@ -778,25 +821,25 @@ export class TongjiBalance {
    * 统计接口没有可用数据时保留上一次结果。
    */
   async fetchUsage(token, signal) {
-    const ranges = this.usageRange ? [this.usageRange] : USAGE_RANGES
-    let stats = undefined
-    let usedRange = null
+    const ranges = this.usageRange
+      ? [this.usageRange, ...USAGE_RANGES.filter((range) => range !== this.usageRange)]
+      : USAGE_RANGES
     for (const range of ranges) {
       const response = await apiRequest('GET', '/my-usage/stats', { token, signal, query: { kind: 'plan', range } })
-      if (response.status === 401) return null
-      if (response.status === 200 && response.body?.data) {
-        stats = response.body.data
-        usedRange = range
-        break
+      if (response.status === 401) return { error: 'session' }
+      if (response.status === 400 || response.status === 404 || response.status === 422) continue
+      if (response.status !== 200) return { error: 'unavailable' }
+      if (!response.body?.data) continue
+
+      const history = await apiRequest('GET', '/my-usage/history', { token, signal, query: { months: 12 } })
+      if (history.status === 401) return { error: 'session' }
+      const daily = history.body?.data
+      if (history.status !== 200 || !daily || (daily.list != null && !Array.isArray(daily.list))) {
+        return { error: 'unavailable' }
       }
+      return { usage: normalizeUsage({ range, stats: response.body.data, history: daily }) }
     }
-    if (!stats) return null
-    const history = await apiRequest('GET', '/my-usage/history', { token, signal, query: { months: 12 } })
-    return normalizeUsage({
-      range: usedRange,
-      stats,
-      history: history.status === 200 ? history.body?.data : undefined,
-    })
+    return { error: 'unavailable' }
   }
 
   refresh() {
@@ -813,27 +856,31 @@ export class TongjiBalance {
     return inflight
   }
 
-  /**
-   * 只刷统计、不重登也不动余额：设置页的「刷新统计」按钮走这里。
-   * 拿不到 token 时退化成整轮刷新，保证首次点也能出数。
-   */
-  refreshUsage() {
-    const token = this.token
-    if (!token) return this.refresh()
-    if (this.usageInflight?.token === token) return this.usageInflight.promise
+  async refreshUsage() {
     const signal = this.accountSession.signal
+    if (!this.token) await this.refresh()
+    if (signal.aborted || !this.token || this.pendingChallenge) return this.state
+    return this.refreshUsageWithToken(this.token, signal)
+  }
+
+  refreshUsageWithToken(token, signal) {
+    if (this.usageInflight?.token === token && this.usageInflight.signal === signal) {
+      return this.usageInflight.promise
+    }
     const promise = this.fetchUsage(token, signal)
-      .then((usage) => {
-        if (usage && !signal.aborted && this.token === token) {
+      .catch(() => ({ error: 'unavailable' }))
+      .then(({ usage, error }) => {
+        if (signal.aborted || this.token !== token) return this.state
+        if (usage) {
           this.usageRange = usage.range
-          this.publish({ ...this.state, usage })
+          return this.publish({ ...this.state, usage, usageError: null })
         }
-        return this.state
-      }, () => this.state)
+        return this.state.usageError === error ? this.state : this.publish({ ...this.state, usageError: error })
+      })
       .finally(() => {
         if (this.usageInflight?.promise === promise) this.usageInflight = undefined
       })
-    this.usageInflight = { token, promise }
+    this.usageInflight = { token, signal, promise }
     return promise
   }
 
@@ -887,7 +934,7 @@ export class TongjiBalance {
       })
       if (mode === 'points') this.refreshPointsReset(token, signal)
       // 余额先显示，用量失败或超时都保留上一次统计。
-      void this.refreshUsage()
+      void this.refreshUsageWithToken(token, signal)
     } catch (error) {
       if (signal.aborted) return this.state
       this.fetchedAt = Date.now()
@@ -920,6 +967,8 @@ Object.defineProperty(TongjiBalance.prototype, REMOTE_METHODS, {
     version: 1,
     methods: Object.freeze([
       { method: 'snapshot', invocation: Object.freeze({ kind: 'direct' }) },
+      { method: 'refreshBalance', invocation: Object.freeze({ kind: 'direct' }) },
+      { method: 'checkModelConnection', invocation: Object.freeze({ kind: 'direct' }) },
       { method: 'watch', mode: 'stream', invocation: Object.freeze({ kind: 'direct' }) },
       { method: 'configure', invocation: Object.freeze({ kind: 'direct' }) },
       { method: 'forget', invocation: Object.freeze({ kind: 'direct' }) },

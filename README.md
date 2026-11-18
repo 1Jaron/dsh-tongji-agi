@@ -2,7 +2,7 @@
 
 把同济大学人工智能服务平台（`agi.tongji.edu.cn`）接进 DeepSeek Harness，做两件事：
 
-1. **模型路由**：以 `llm-pi-ai` 的一个 provider（`tongji`）提供 8 个对话模型，走 OpenAI Chat Completions 协议。
+1. **模型路由**：以 `llm-pi-ai` 的一个 provider（`tongji`）提供对话模型，走 OpenAI Chat Completions 协议。
 2. **余额与用量面板**：在设置的「同济AGI」分区查看余额、积分重置时间和用量统计，按需把这些信息显示在侧边栏底部。
 
 两半互相独立：只用模型不需要登录 SSO；只用面板也不需要 API key（面板走统一身份认证）。
@@ -68,8 +68,8 @@ https://github.com/1Jaron/dsh-tongji-agi
 
 启用后：
 
-- 模型选择器出现「同济 AGI」下的 8 个模型。
-- 设置页新增「同济AGI」分区，内含 API Key 配置引导、余额、重置时间和用量。
+- 模型选择器出现「同济 AGI」下的预设模型。
+- 设置页的「同济AGI」分区集中显示余额、重置时间、今日用量和趋势。「模型连接」内有 API Key 配置指引和连接检测。
 - 左侧栏底部显示积分摘要，可在「侧边栏显示」中点击图标卡片自定义。
 
 ---
@@ -92,6 +92,8 @@ https://github.com/1Jaron/dsh-tongji-agi
 2. 打开 DSH 的 **设置 → 模型 → 同济 AGI → 编辑**，填入「API 密钥」并保存。
 3. 在会话的模型选择器里选择同济 AGI 的模型。要查看余额、重置时间和用量，请另外在 **设置 → 同济AGI → 账号设置** 登录统一身份认证。
 
+在 **设置 → 同济AGI → 模型连接** 点击「检测模型连接」，可使用已保存的 Key 查询套餐模型目录并确认是否列出 Kimi。检测只读取 `/v1/models`。
+
 `cordis.patch.yml` 里的 `apiKeyEnv: TONGJI_API_KEY` 只是**引用名**，不是密钥本身。每次请求由凭据 seam 解析，优先级：托管凭据库（`$DSH_HOME/.credentials.yaml`）→ 进程环境变量 → `.env`。
 
 也可通过宿主凭据库或环境变量配置。
@@ -111,7 +113,7 @@ $env:TONGJI_API_KEY = 'sk-...'
 
 ## 模型
 
-`models` 按该 key 实际可用的 `GET /v1/models` 填写。2026-11-06 实测 10 个，其中 Qwen3-Embedding、Qwen3-Reranker 不是对话模型，未列入；下表是 patch 里启用的 8 个。
+`models` 以套餐 API 的 `GET /v1/models` 返回为准。2026-11-06 实测列表中的 8 个对话模型继续保留。新增的 Kimi 条目来自[同济大学官方服务页](https://nic.tongji.edu.cn/fwzn/kyfw/rgznfwpt.htm)，实际可用性取决于套餐和网络环境。
 
 | id | 备注 |
 | --- | --- |
@@ -123,8 +125,9 @@ $env:TONGJI_API_KEY = 'sk-...'
 | `MiniMax-M3.1-Flash` | |
 | `MiMo-V2.6-Pro` | |
 | `MiMo-V2.6-Flash` | |
+| `Kimi-K3.1-Pro` | 使用 provider 默认上下文与输出预算 |
 
-每个模型都写了 `contextWindow: 65536` / `maxTokens: 8192` / `input: [text]`；provider 级也有同名的 `defaultContextWindow` / `defaultMaxTokens`，保留逐模型显式值是为了方便单独覆盖。
+模型输入配置为 `[text]`。provider 使用 `defaultContextWindow: 65536` 和 `defaultMaxTokens: 8192`，逐模型可覆盖预算。
 
 平台文档里提到但**不可用**的：`DeepSeek-R1` 系列返回
 
@@ -180,9 +183,9 @@ $env:TONGJI_API_KEY = 'sk-...'
 
 点数模式下，插件和平台「我的套餐」一样选择最近生效且未过期的套餐，用 `next_reset_at` 显示下次重置时间（北京时间）。`points_reset_cycle` 为 `week` 时标注「每 7 天」，为 `month` 时标注「每月」。套餐查询在后台独立刷新，平台暂未返回有效时间时会显示提示。
 
-`range` 依次尝试 `1d` / `7d` / `30d`，后续沿用第一个成功的区间。余额先显示，用量在后台刷新。用量统计请求失败时保留上次结果。设置页的「刷新统计」使用当前令牌，首次还没有令牌时会先刷新余额。
+`range` 依次尝试 `1d` / `7d` / `30d`，后续优先使用上次成功的区间。点击余额卡的「刷新余额」会等待余额查询结束，用量在后台刷新。「刷新统计」在现有令牌下独立查询用量，首次还没有令牌时会先刷新余额。用量查询失败时保留上次数据并显示最后成功更新时间。
 
-用量概览显示平台统计区间、调用次数、Token 和消耗点数。每日趋势支持查看近 7、14、30 个北京时间自然日，可点选柱子查看当天明细，也可展开日期表。模型表按 Token 总量降序列出每个模型的输入、缓存、输出、总量和占比。侧边栏的「今日 Token」只显示平台当天的记录。
+用量概览显示平台统计区间、调用次数、Token 和消耗点数。每日趋势支持查看近 7、14、30 个北京时间自然日，可点选柱子查看当天明细，也可展开日期表。模型表按 Token 总量降序展示名称、总 Token 和占比，点模型名称展开输入、缓存、输出明细。余额卡和侧边栏的今日用量按北京时间读取平台当天的记录。
 
 ---
 
@@ -232,7 +235,7 @@ SSO 仅访问 `iam.tongji.edu.cn` 和 `agi.tongji.edu.cn` 的 HTTPS 地址，密
 | `LICENSE` | MIT |
 | `.gitattributes` | 强制 LF，避免 Windows 检出时 CRLF 污染 YAML / JS |
 
-7 个远程方法（`snapshot` / `watch` / `configure` / `forget` / `submitCode` / `resendCode` / `refreshUsage`）必须在三处保持一致：`index.js` 的 `REMOTE_METHODS` 方法表、`lib/typert.host.js` 的 `invocations`、`lib/client.js` 的 `CONTRIBUTION.descriptors`。任一处缺失，客户端就调不到该方法（`remote.tongji` 静默降级，只在日志里 warn）。
+远程方法（`snapshot` / `watch` / `configure` / `forget` / `submitCode` / `resendCode` / `refreshBalance` / `refreshUsage` / `checkModelConnection`）必须在三处保持一致：`index.js` 的 `REMOTE_METHODS` 方法表、`lib/typert.host.js` 的 `invocations`、`lib/client.js` 的 `CONTRIBUTION.descriptors`。
 
 `package.json` 的关键字段：
 

@@ -66,6 +66,9 @@
             contextWindow: 65536
             maxTokens: 8192
             input: [text]
+          - id: Kimi-K3.1-Pro
+            name: Kimi K3.1 Pro
+            input: [text]
 
       # 同一平台另外两种协议端点，按需取消注释（同一把 key，字段同上）：
       #
